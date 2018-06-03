@@ -1,0 +1,295 @@
+#!/usr/bin/perl -w
+
+# Ansible module to manage vmdk disks
+# based on vmdkManagement.pl by William Lam of VMware
+
+# WANT_JSON
+
+use strict;
+use warnings;
+use VMware::VILib;
+use VMware::VIRuntime;
+use AnsibleModule;
+use Data::Dumper;
+
+#
+# global variables
+#
+my $param_debug_level = 2;
+my $debug_log = "";
+my $changed = 0;
+my $nogo = -1;
+
+my $module = AnsibleModule->new(
+  argument_spec => {
+    action       => { required => 1, type => choices => ['add', 'remove', 'destroy'] },
+    controller  => { required => 0, default => 1 },
+    vmname => { required => 1 },
+    vmdkname => { required => 1 },
+	vmdktype => { required => 0, default => 'virtual', type => choices => ['virtual', 'raw'] },
+    datastore => { required => 0 },
+    debug_level => { required => 0, default => 0 },
+    list => {}
+  },
+  supports_check_mode => 0,
+  check_invalid_arguments => 0
+);
+
+my $params = $module->params;
+
+Opts::parse();
+Opts::validate();
+Util::connect();
+
+my $vmdkname = $params->{vmdkname};
+my $vmdktype = $params->{vmdktype};
+my $datastore = $params->{datastore};
+my $vmname = $params->{vmname};
+my $controller_id = $params->{controller};
+my $operation = $params->{action};
+my $fullpath = undef;
+$param_debug_level = $params->{debug_level};
+
+my $vm = Vim::find_entity_view(view_type => 'VirtualMachine',
+                               filter => {"config.name" => $vmname});
+
+unless ($vm) {
+  Util::disconnect();
+  $module->fail_json("Unable to find VM: '$vmname'!");
+}
+
+if($operation eq 'add') {
+  unless($datastore) {
+    Util::disconnect();
+    $module->fail_json(msg => "For 'add' operation, you need the following parameters defined: 'datastore'!");
+  }
+  &addExistingVMDK($vm,$datastore,$vmdkname,$vmdktype,$controller_id);
+}
+elsif($operation eq 'remove') {
+  &removeVMDK($vm,$vmdkname,$datastore,0,$vmdktype);
+}
+elsif($operation eq 'destroy') {
+  &removeVMDK($vm,$vmdkname,$datastore,1,$vmdktype);
+}
+
+Util::disconnect();
+$module->exit_json( changed => $changed, stdout => $debug_log);
+
+sub mDebug($$){
+
+  my ($level,$message) = @_;
+  my $indent = "";
+
+  if( $level > $param_debug_level ){ return( $nogo ); }
+
+  while( $level>0 ) { $indent = "${indent}   "; $level-- }
+
+  #printf "${indent}${message}\n";
+  $debug_log = $debug_log . "${indent}${message}\n";
+
+  # debug returns nogo allowing errors to return a message and then exit
+  # positives ignore this
+  return( $nogo );
+
+} # mDebug
+
+sub removeVMDK {
+  my ($vm,$file,$dsname,$des,$vmdktype) = @_;
+  
+  my ($disk,$config_spec_operation, $config_file_operation);
+  $config_spec_operation = VirtualDeviceConfigSpecOperation->new('remove');
+  $config_file_operation = VirtualDeviceConfigSpecFileOperation->new('destroy');
+  
+  $disk = &find_disk(vm => $vm,
+                     fileName => $file,
+                     datastore => $dsname,
+  	             vmdktype => $vmdktype);
+  
+  if($disk) {
+    my ($devspec,$op_string1,$op_string2);
+    if($des eq 1) {
+      $devspec = VirtualDeviceConfigSpec->new(operation => $config_spec_operation,
+                                              device => $disk,
+                                              fileOperation => $config_file_operation);
+      $op_string1 = "destroy";
+      $op_string2 = "destroyed";
+    }
+    else {
+      $devspec = VirtualDeviceConfigSpec->new(operation => $config_spec_operation,
+                                              device => $disk);
+      $op_string1 = "remove";
+      $op_string2 = "removed";
+    }
+    
+    my $vmspec = VirtualMachineConfigSpec->new(deviceChange => [$devspec] );
+    eval {
+      mDebug(0, "Reconfiguring '" . $vm->name . "' to " . $op_string1 . " VMDK: '$file' ");
+      $vm->ReconfigVM( spec => $vmspec );
+      mDebug( 0, "Sucessfully " . $op_string2 . " VMDK to '$vmname'!");
+      $changed = 1;
+    };
+    if($@) {
+      $module->fail_json(msg => $@, stderr => $debug_log, changed => 0);
+    }
+  }
+  else {
+    mDebug(0, "Specified VMDK is not attached to the vm");
+  }
+}
+
+sub addExistingVMDK {
+  my ($vm,$dsname,$file,$vmdktype,$controller_id) = @_;
+  
+  my $ds = &find_datastore(vm => $vm, datastore => $dsname);
+  unless($ds) {
+    Util::disconnect();
+    $module->fail_json("Unable to locate datastore: '" . $dsname . "'");
+  }
+  
+  my $disk = &find_disk(vm => $vm,
+                       fileName => $file,
+                       datastore => $dsname,
+  	               vmdktype => $vmdktype);
+  
+  $module->exit_json(msg => "Specified VMDK is already connected to vm") if($disk);
+
+  
+  my $size = &find_vmdk(datastore => $ds, file => $file);
+  
+  unless($size) {
+    Util::disconnect();
+    $module->fail_json("Unable to locate VMDK: '$file'");
+  }
+  my $controller = &find_device(vm => $vm,
+                                controller => "SCSI controller " . $controller_id);
+  unless($controller) {
+    Util::disconnect();
+    $module->fail_json("Unable to locate SCSI controller " . $controller_id);
+  }
+  my $controllerKey = $controller->key;
+  
+  my $disk_backing_info;
+  if ($vmdktype eq 'virtual') {
+    $disk_backing_info = VirtualDiskFlatVer2BackingInfo->new(datastore => $ds,
+                                                             fileName => $fullpath,
+                                                             diskMode => "persistent");
+  }
+  elsif ($vmdktype eq 'raw') {
+    $disk_backing_info = VirtualDiskRawDiskMappingVer1BackingInfo->new(datastore => $ds,
+                                                                       fileName => $fullpath);
+  }
+  else {
+    Util::disconnect();
+	$module->fail_json(msg => "vmdktype can be either 'virtual' or 'raw'!");
+  }
+  
+  my $disk = VirtualDisk->new(controllerKey => $controllerKey,
+                              unitNumber => -1,
+                              key => -1,
+                              backing => $disk_backing_info,
+                              capacityInKB => $size);
+  
+  my $devspec = VirtualDeviceConfigSpec->new(operation => VirtualDeviceConfigSpecOperation->new('add'), device => $disk);
+  
+  my $vmspec = VirtualMachineConfigSpec->new(deviceChange => [$devspec]);
+  eval {
+    mDebug(0, "Reconfiguring '" . $vm->name . "' to add VMDK: '$fullpath'.");
+    $vm->ReconfigVM( spec => $vmspec );
+    mDebug(0, "Sucessfully added VMDK to '$vmname'.");
+    $changed = 1;
+  };
+  if($@) {
+    $module->fail_json(msg => $@, stderr => $debug_log, changed => 0);
+  }
+}
+
+sub find_datastore {
+   my %args = @_;
+   my $vm = $args{vm};
+   my $dsname = $args{datastore};
+   my $host = Vim::get_view(mo_ref => $vm->runtime->host);
+   my $datastore = Vim::find_entity_view(view_type => 'Datastore',
+                                         filter => {'summary.name' => qr/^${dsname}$/});
+   return $datastore;
+}
+
+sub find_disk {
+  my %args = @_;
+  my $vm = $args{vm};
+  my $name = $args{fileName};
+  my $dsname = $args{datastore};
+  my $vmdktype = $args{vmdktype};
+
+  my $devices = $vm->config->hardware->device;
+  foreach my $device (@$devices) {
+    if($device->isa('VirtualDisk')) {
+      if ($vmdktype eq 'virtual') {
+        if($device->backing->isa('VirtualDiskFlatVer2BackingInfo')) {
+          my ($vm_ds,$vmdk_path) = split(']',$device->backing->fileName,2);
+          $vm_ds =~ s/^.//;
+          $vmdk_path =~ s/^.//;
+          my ($vm_dir,$vm_vmdk) = split('/',$vmdk_path,2);
+          return $device if ($vm_vmdk eq $name) && ($vm_ds =~ qr/$dsname/);
+        }
+      }
+      elsif ($vmdktype eq 'raw') {
+        if($device->backing->isa('VirtualDiskRawDiskMappingVer1BackingInfo')) {
+          my ($vm_ds,$vmdk_path) = split(']',$device->backing->fileName,2);
+          $vm_ds =~ s/^.//;
+          $vmdk_path =~ s/^.//;
+          my ($vm_dir,$vm_vmdk) = split('/',$vmdk_path,2);
+          return $device if ($vm_vmdk eq $name) && ($vm_ds =~ qr/$dsname/);
+        }
+      }
+	  else {
+	    Util::disconnect();
+	    $module->fail_json(msg => "vmdktype can be either 'virtual' or 'raw'!");
+	  }
+    }
+  }
+  return undef;
+}
+
+sub find_device {
+  my %args = @_;
+  my $vm = $args{vm};
+  my $name = $args{controller};
+  
+  my $devices = $vm->config->hardware->device;
+  foreach my $device (@$devices) {
+    return $device if ($device->deviceInfo->label eq $name);
+  }
+  return undef;
+}
+
+sub find_vmdk {
+  my %args = @_;
+  my $datastore = $args{datastore};
+  my $vmdk = $args{file};
+  my $browser = Vim::get_view (mo_ref => $datastore->browser);
+  my $ds_path = "[" . $datastore->info->name . "]";
+  
+  my $disk_flags = VmDiskFileQueryFlags->new(capacityKb => 'true', diskType => 'true', thin => 'false', hardwareVersion => 'false');
+  my $detail_query = FileQueryFlags->new(fileOwner => 0, fileSize => 1,fileType => 1,modification => 0);
+  my $disk_query = VmDiskFileQuery->new(details => $disk_flags);
+  my $searchSpec = HostDatastoreBrowserSearchSpec->new(query => [$disk_query], details => $detail_query, matchPattern => [$vmdk]);
+  my $search_res = $browser->SearchDatastoreSubFolders(datastorePath => $ds_path,searchSpec => $searchSpec);
+  
+  foreach my $result (@$search_res) {
+    my $files = $result->file;
+    my $folder = $result->folderPath;
+    
+	foreach my $file (@$files) {
+      if(ref($file) eq 'VmDiskFileInfo') {
+        my $disk = $file->path;
+        my $cap = $file->capacityKb;
+        if ($vmdk eq $disk) {
+          $fullpath = $folder . $vmdk;
+          return $cap;
+        }
+      }
+    }
+  }
+  return undef;
+}
+

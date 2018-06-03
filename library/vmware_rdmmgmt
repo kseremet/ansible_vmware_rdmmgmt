@@ -1,0 +1,809 @@
+#!/usr/bin/perl
+#
+# VMware Perl SDK LUN management tool
+#
+# based on lunmanagement.pl by William Lam of VMware
+#
+# Version History
+#
+# 11-FEB-2015 - GCT - 1.0.1 - initial version
+# 21-MAY-2015 - GCT - 1.0.2 - rescan issued to all nodes of esx cluster
+# 15-JUL-2015 - GCT - 1.0.3 - checks to ensure devices are attached after rescan
+# 10-NOV-2015 - GCT - 1.0.5 - added storage refresh after hba rescan and allowed cluster to be named in args
+# 29-DEC-2015 - GCT - 1.1.0 - rescan of hbas now option for cases where that has been done manually, test mode
+
+# WANT_JSON
+
+use strict;
+use warnings;
+use POSIX;
+use VMware::VILib;
+use VMware::VIRuntime;
+use AnsibleModule;
+use Data::Dumper;
+
+my $module = AnsibleModule->new(
+  argument_spec => {
+    action       => { required => 1, type => choices => [ 'map', 'unmap', 'rescan', 'add_scsi_controller', 'test'] },
+    clustername  => { required => 0 },
+    controller  => { required => 0, default => 1 },
+    controller_type => { required => 0, default => 'ParaVirtual', type => choices => ['LsiLogic', 'LsiLogicSAS', 'BusLogic', 'ParaVirtual']},
+    virtual_scsi_sharing => { required => 0, default => 'noSharing', type => choices => ['noSharing', 'virtualSharing', 'physicalSharing']},
+    rescan => { required => 0, default => 'no', type => choices => ['yes', 'no'] },
+    vmname => { required => 1 },
+    naa => { required => 0, type => 'list' },
+    debug_level => { required => 0, default => 0 },
+    list => {}
+  },
+  supports_check_mode => 0,
+  check_invalid_arguments => 0
+);
+
+my $params = $module->params;
+
+#
+# global variables
+#
+my $nogo = -1;
+my $okay = 1;
+my $script_error = "rdmmgmt critical error";
+my $param_debug_level = 2;
+my $debug_log = "";
+my $changed = 0;
+
+my ($caAction,$caClusterName,$caESXHostName,$caRescan,$caVMName,$gplstAllClusters,$nResult,$nSCSI,$pVMView,$pESXHost,$nScsiControllerType,$nVirtualScsiSharing);
+
+#
+# output mDebug infomration depending on the mDebug level set in the config file
+#
+
+sub mDebug($$){
+
+  my ($level,$message) = @_;
+  my $indent = "";
+
+  if( $level > $param_debug_level ){ return( $nogo ); }
+
+  while( $level>0 ) { $indent = "${indent}   "; $level-- }
+
+  #printf "${indent}${message}\n";
+  $debug_log = $debug_log . "${indent}${message}\n";
+
+  # debug returns nogo allowing errors to return a message and then exit
+  # positives ignore this
+  return( $nogo );
+
+} # mDebug
+
+#
+# taking the esx host name
+# determine the esx cluster the host is part of
+# and return its name
+# otherwise return null
+#
+
+sub fQueryClusterName {
+
+  my ($esx_hostname) = @_;
+
+  # step through the list of ESX clusters found
+  foreach my $pESXCluster (@$gplstAllClusters) {
+
+    # pull the cluster name
+    my $caClusterName = $pESXCluster->name;
+
+    my $plstESXHosts = Vim::get_views(mo_ref_array => $pESXCluster->host);
+
+    foreach my $pESXHost (@$plstESXHosts) { if($pESXHost->name eq $esx_hostname) { return( $caClusterName ); }}
+
+  } # end foreach
+
+  return "";
+
+} # fQueryClusterName
+
+#
+# rescan the HBAs of all servers in the ESX cluster
+# warning - this can cause VMware to lock up
+# the storage view refresh call is supposed to mitigate that problem
+# google "rescan-o-death" to see the problem
+#
+
+sub mHBARescan($) {
+
+  my ($cluster_name) = @_;
+
+  # issue a rescan of the HBAs
+  mDebug( 0, "rescanning HBAs" );
+
+  # step through the list of esx clusters in the data center
+  foreach my $pESXCluster (@$gplstAllClusters) {
+
+    # if this cluster matches the name of the one supplied
+    if ( $pESXCluster->name eq $cluster_name ) {
+
+      my $plstESXHosts = Vim::get_views(mo_ref_array => $pESXCluster->host);
+
+      # step through each host in the cluster
+      foreach my $pESXHost (@$plstESXHosts) {
+
+        mDebug( 1, "cluster:".$pESXCluster->name." host found:".$pESXHost->name );
+
+        # get a pointer to the storage subsystem of the host
+        my $pStorage = Vim::get_view( mo_ref => $pESXHost->configManager->storageSystem );
+
+        # issue a rescan of the HBAs
+        mDebug( 1, "rescanning HBAs on host ".$pESXHost->name );
+        eval { $pStorage->RescanAllHba( ); };
+        if($@) { mDebug( 0, "$script_error: HBA rescan failed" ); }
+
+        # issue a storage refresh
+        mDebug( 1, "refreshing storage system on host ".$pESXHost->name );
+        eval { $pStorage->RefreshStorageSystem( ); };
+        if($@) { mDebug( 0, "$script_error: storage refresh failed" ); }
+
+      } # end foreach - esx hosts on cluster
+    } # end if
+  } # end foreach - esx clusters
+  $changed = 1;
+
+} # mHBARescan
+
+#
+# attach the specified luns back to the esx hosts in the cluster
+# this allows us to undo an earlier detach to remount the same snapshot
+# as before
+#
+
+sub mRDMAttach($$@) {
+
+  my ($cluster_name, $vm_name, @naa_list) = @_;
+
+  mDebug( 0, "verifying LUNs are attached and mounted to the ESX hosts" );
+
+  my $nStatus = $okay;
+
+  my %NAA;
+  foreach (@naa_list) { $NAA{$_}++; }
+
+  # step through the list of esx clusters in the data center
+  foreach my $pESXCluster (@$gplstAllClusters) {
+
+    # if this cluster matches the name of the one supplied
+    if ( $pESXCluster->name eq $cluster_name ) {
+
+      my $plstESXHosts = Vim::get_views(mo_ref_array => $pESXCluster->host);
+
+      # step through each host in the cluster
+      foreach my $pESXHost (@$plstESXHosts) {
+
+        mDebug( 1, "cluster:".$pESXCluster->name." host:".$pESXHost->name );
+
+        # get a pointer to the storage subsystem of the host
+        my $pStorage = Vim::get_view( mo_ref => $pESXHost->configManager->storageSystem );
+
+
+        # query a list of all scsi devices connected to this ESX host
+	my $devices = eval{$pStorage->storageDeviceInfo->scsiLun || [] };
+	foreach my $device (@$devices) {
+
+          # step through the list of devices looking to see if they match the naas passed as an argument
+	  my $caNAA = $device->canonicalName;
+	  my $caStatus = $device->operationalState->[0];
+	  my $caUUID = lc( $device->uuid );
+	  my $caLookup = $caNAA;
+	  $caLookup =~ s/^naa.//g;
+
+          # check if the LUN ID we found matches one of the NAAs we are looking for
+	  if( exists( $NAA{ $caLookup } )) {
+
+	    mDebug( 2, "device:" . $caNAA . " state:" . $caStatus . " uuid:" . $caUUID );
+
+            if( $caStatus =~ m/off/i ) {
+
+              mDebug( 0, "lun " . $caNAA . " is not attached, trying to attach it now" ) ;
+
+              # try attaching the LUN UUID to the hosts storage system
+              eval { $pStorage->AttachScsiLun( lunUuid => $caUUID ); };
+
+              if($@) {
+
+                mDebug( 0, "warning: unable to attach lun - UUID $caUUID" );
+                $nStatus = $nogo;
+
+              } else {
+
+                mDebug( 2, "lun successfully attached" );
+
+              } # end else
+
+            } # end if status is off
+	  } # end if naa exists in the list
+        } # end for all devices found on the esx server
+      } # end foreach - esx hosts on cluster
+    } # end if
+  } # end foreach - esx clusters
+
+  return( $nStatus );
+
+} # mRDMAttach
+
+#
+# detach the specified NAAs from every ESX host in the cluster
+# this prevents an All-Paths-Down error condition on ESX hosts
+# that were not running the guest VM
+# such conditions cause the cluster to lock up or crash
+#
+
+sub mRDMDetach($$@) {
+
+  my ($cluster_name, $vm_name, @lstNAA) = @_;
+
+  my $nStatus = $okay;
+
+  my %NAA;
+  foreach (@lstNAA) { $NAA{$_}++; }
+
+  # step through the list of esx clusters in the data center
+  foreach my $pESXCluster (@$gplstAllClusters) {
+
+    if ( $pESXCluster->name eq $cluster_name ) {
+
+      my $plstESXHosts = Vim::get_views(mo_ref_array => $pESXCluster->host);
+
+      foreach my $pESXHost (@$plstESXHosts) {
+
+        mDebug( 1, "cluster:".$pESXCluster->name." host:".$pESXHost->name );
+
+    ##    my $hostView = Vim::get_view(mo_ref => $_->key );
+        my $pStorage = Vim::get_view( mo_ref => $pESXHost->configManager->storageSystem );
+        my $plstDevices = eval{$pStorage->storageDeviceInfo->scsiLun || []};
+
+        foreach my $pDevice (@$plstDevices) {
+
+          my $caNAA = $pDevice->canonicalName;
+          my $caLUN_UUID=lc($pDevice->uuid);
+
+          if ($caLUN_UUID =~ m/^[0-9a-f]{10}([0-9a-f]{16})/ && $NAA{$1}) {
+
+            mDebug( 1, "detaching lun $caNAA" );
+
+ 	    eval { $pStorage->DetachScsiLun( lunUuid => $caLUN_UUID ); };
+
+            if($@) {
+
+              mDebug( 0, "warning: unable to detach lun - UUID $caLUN_UUID" );
+              $nStatus = $nogo;
+
+            } else {
+
+              mDebug( 2, "lun successfully detached" );
+
+            } # end else
+          } # end if
+        } # end for each - devices on esx host\
+      } # end foreach - esx hosts on cluster
+    } # end if
+  } # end foreach - esx clusters
+
+  return( $nStatus );
+
+} # mRDMDetach
+
+#
+# mRDMUnMap
+# Passed : VM object and a list of one or more NAA's to unmap from that object
+#
+
+sub mRDMUnMap($@) {
+
+  my ($vmview, @naa_list) = @_;
+
+  mDebug( 0, "unmapping RDMs from virtual machine" );
+
+  #my %NAA;
+  #foreach (@naa_list) { $NAA{$_}++; }
+
+  my $pConfigSpecOp = VirtualDeviceConfigSpecOperation->new('remove');
+  my $pConfigFileOp = VirtualDeviceConfigSpecFileOperation->new('destroy');
+
+  my @lstDevSpecs;
+  my $plstDevices = $vmview->config->hardware->device;
+
+  foreach my $pDevice (@$plstDevices) {
+
+    if ($pDevice->isa('VirtualDisk') && $pDevice->backing->isa('VirtualDiskRawDiskMappingVer1BackingInfo')) {
+
+      my $caLUN_UUID=lc($pDevice->backing->lunUuid);
+
+      #if ($caLUN_UUID =~ m/^[0-9a-f]{10}([0-9a-f]{16})/ && $NAA{$1}) {
+      foreach (@naa_list) {
+      if ($caLUN_UUID =~ $_) {
+
+        mDebug( 1, "LUN ID:$caLUN_UUID" );
+
+        push @lstDevSpecs, VirtualDeviceConfigSpec->new(
+          operation => $pConfigSpecOp,
+          device => $pDevice,
+          fileOperation => $pConfigFileOp );
+
+      } # end if
+      }
+    } # end if
+  } # end foreach
+
+  # if we found matchine devices to remove from the guest VM
+  if (@lstDevSpecs) {
+
+    my $pVMSpec = VirtualMachineConfigSpec->new(deviceChange => \@lstDevSpecs );
+
+    eval {
+
+      mDebug( 0, "reconfiguring VM" );
+      $vmview->ReconfigVM( spec => $pVMSpec );
+      mDebug( 0, "successfully removed ".scalar(@lstDevSpecs)." RDM(s) from VM" );
+      $changed = 1;
+
+    };
+
+    # catch error conditions
+    if($@) { return( mDebug( 0, "$script_error:".$@ )); }
+
+  } else {
+
+    mDebug( 0, "no mapped LUNs found matching any NAA passed" );
+    return( 0 );
+
+  } # end else
+
+  return( scalar(@lstDevSpecs) );
+
+} # mRDMUnMap
+
+#
+# mRDMMap
+# Passed : VM object, SCSI controller number, and a list of one or more NAA's to map to that object
+#
+
+sub mRDMMap($$$@) {
+
+  my ($cluster_name, $esx_host, $vmview, $scsi_controller, @naa_list) = @_;
+
+  mDebug( 0, "mapping RDMs to virtual machine using SCSI controller " . $scsi_controller );
+
+  my $caRDMMode="physicalMode";
+  my $pSCSIController;
+
+  my %NAA;
+  foreach (@naa_list) { $NAA{$_}++; }
+
+
+  my $caFilePrefix;
+  my %fn_used;
+  my $plstDevices = $vmview->config->hardware->device;
+  my $datastore_name;
+  my @vmdks = ();
+
+  # determine vmdk names currently in use so we dont clobber them with the new RDM mapping file
+  foreach my $pDevice (@$plstDevices) {
+
+    # if this matches the specified SCSI controller
+    $pSCSIController = $pDevice->key if ( $pDevice->deviceInfo->label eq "SCSI controller ".$scsi_controller );
+
+    if ($pDevice->isa('VirtualDisk')) {
+
+      mDebug( 2, "existing RDM mapping file:" . $pDevice->backing->fileName );
+
+      $caFilePrefix=$1 if (!$caFilePrefix && ($pDevice->backing->fileName =~ m/^(.*?)(_[0-9]+)?\.vmdk$/));
+      $fn_used{lc($pDevice->backing->fileName)}++;
+
+    } # end if
+  } # end foreach
+
+  # trap non existent SCSI controller
+  if (!$pSCSIController) {
+    mDebug( 0, "unable to find SCSI controller $scsi_controller" );
+    $module->fail_json(msg => "unable to find SCSI controller $scsi_controller", stderr => $debug_log);
+  }
+
+  my $nFileNum=0;
+  my $caFileNam;
+  my $nFileCnt=scalar(@naa_list);  # Number of filenames we need
+  my @FN;
+
+  # build a list of new RDM mapping file names to use
+  while($nFileCnt>0) {
+    $nFileNum++;
+    $caFileNam=$caFilePrefix."_".$nFileNum.".vmdk";
+    if (!$fn_used{lc($caFileNam)}) {
+      push @FN, $caFileNam;
+      if ($caFileNam =~ m:^\[(.+)\]\s.+/([^/]+.vmdk)$:) {
+        $datastore_name = $1;
+        push @vmdks, $2;
+      }
+      $nFileCnt--;
+    }
+  } # end while
+  foreach (@FN) { mDebug( 2, "new RDM mapping file:$_" ); }
+
+  my $pDataStore = Vim::get_view( mo_ref => $esx_host->configManager->datastoreSystem );
+  my @lstDevSpecs;
+
+  my (%hDeviceName, %hDeviceUUID, %hDeviceSize);
+
+  eval {
+
+    my $lstDisks = $pDataStore->QueryAvailableDisksForVmfs( );
+
+    foreach(@$lstDisks) {
+
+      mDebug( 2, "available disk for vmfs:" . $_->devicePath  );
+
+      if ($_->devicePath =~ m%/naa.([0-9a-f]+)$% && $NAA{$1}) {
+
+        mDebug( 4, "device uuid:" . $_->uuid );
+        mDebug( 4, "capacity:" . $_->capacity->block . " blocksize: " . $_->capacity->blockSize );
+
+        delete $NAA{$1};
+        $hDeviceName{$1} = $_->deviceName;
+        $hDeviceUUID{$1} = $_->uuid;
+        $hDeviceSize{$1} = int(($_->capacity->blockSize * $_->capacity->block)/1024);
+
+      } # end if
+    } # end foreach
+  };
+
+  # need a unique key for each disk or it fails
+  my $nUnique=-1;
+
+  foreach (keys %hDeviceName) {
+
+    mDebug( 4, "device name " . $hDeviceName{$_} . " unique:" . $nUnique );
+
+    my $pDiskInfo = VirtualDiskRawDiskMappingVer1BackingInfo->new(
+      compatibilityMode => $caRDMMode,
+      deviceName => $hDeviceName{$_},
+      lunUuid => $hDeviceUUID{$_},
+      diskMode => "persistent",
+      fileName => (shift @FN)
+    );
+
+    my $pDisk = VirtualDisk->new(
+      controllerKey => $pSCSIController,
+      unitNumber => -1,
+      key => $nUnique--,
+      backing => $pDiskInfo,
+      capacityInKB => $hDeviceSize{$_}
+    );
+
+    push @lstDevSpecs, VirtualDeviceConfigSpec->new(
+      operation => VirtualDeviceConfigSpecOperation->new('add'),
+      device => $pDisk,
+      fileOperation => VirtualDeviceConfigSpecFileOperation->new('create')
+    );
+
+  } # end foreach
+
+  if (@lstDevSpecs) {
+
+    my $pVMSpec = VirtualMachineConfigSpec->new( deviceChange => \@lstDevSpecs );
+
+    eval {
+
+      mDebug( 0, "reconfiguring virtual machine" );
+      $vmview->ReconfigVM( spec => $pVMSpec );
+      mDebug( 0, "successfully added ".scalar(@lstDevSpecs)." RDM(s)" );
+      $module->exit_json(msg => "successfully added ".scalar(@lstDevSpecs)." RDM(s)",
+                         changed => 1,
+                         datastore => $datastore_name,
+                         vmdks => "@vmdks",
+                         stdout => $debug_log);
+    };
+
+    # catch error conditions
+    if($@) {
+      $module->fail_json(msg => $@, stderr => $debug_log, changed => 0);
+    }
+
+  } else {
+
+    mDebug( 0, "no mapped LUNs found matching any NAA passed" );
+    return( $okay );
+
+  } # end else
+
+  return( $okay );
+
+} # mRDMMap
+
+#
+# load the naa file
+# this allows the dba to list the NAAs in a separate file
+# including the Getopt::ArgvFile was too complicated given what VMware had already decided in the SDK
+# this simply tests each NAA in the list to see if it is a file, and then loads it if it is
+# naa list files are optionally generated by xvolmake.pl when the naa_file option is used
+#
+
+sub mLoadNAAFile($) {
+
+  my (@naa_list) = @{$_[0]};
+  my @lstMyList = ();
+
+  foreach my $caNAAFile (@naa_list) {
+    # check if the entry is really a file
+    $caNAAFile =~ s/^\s+|\s+$//g;
+
+    mDebug( 4, "testing naa entry $caNAAFile to determine if it is a file" );
+    my @lfinfo = stat $caNAAFile;
+
+    if( scalar( @lfinfo ) > 0 ) {
+
+       mDebug( 4, "naa entry $caNAAFile is a file" );
+
+       # open and read the contents of the naa include file
+       open( fhIncludeFile,"<$caNAAFile" )|| $module->fail_json( msg => "cannot open naa file $caNAAFile for reading");
+       my @caIncludeFile = <fhIncludeFile>;
+       close fhIncludeFile;
+
+       # read each line, discard comments and look for a directive "naa"
+       # then take everything after the equal or space and treat as a list of naas
+       foreach (@caIncludeFile) {
+
+        # strip npc from the output
+        $_ =~ s/\n|\r|\f//g;
+        $_ =~ s/^\s+|\s+$//g;
+
+        #  if this is not a comment line and it is not empty
+        if( $_ !~ m/^\#/ and length($_) > 0 ) {
+
+          # take before and after the separator which can be equal or a space
+          my $caParam = (split /=| /, $_)[0];
+          my $caArg = (split /=| /, $_)[1];
+
+          mDebug( 4, "*". $caParam . "*" . $caArg . "*" );
+
+          # if the directive is naa, then take the argument as an naa list
+          if( $caParam =~ m/naa/i ) {
+
+            my @lstNAA = split(/[,:]/, $caArg );
+
+            # copy the naa list to the return list
+            foreach my $caNAA ( @lstNAA ) { push( @lstMyList, $caNAA ); }
+
+          } # end if
+        } # end if
+      } # end foreach
+
+    } else {
+
+       mDebug( 4, "naa entry $caNAAFile is not a file" );
+       push( @lstMyList, $caNAAFile );
+
+    } # end else
+
+  } # end foreach
+
+  return( @lstMyList );
+
+} # mLoadNAAFile
+
+#const (
+#    VirtualSCSISharingNoSharing       = VirtualSCSISharing("noSharing")
+#    VirtualSCSISharingVirtualSharing  = VirtualSCSISharing("virtualSharing")
+#    VirtualSCSISharingPhysicalSharing = VirtualSCSISharing("physicalSharing")
+#)
+
+sub mAddScsiCtrl($$$$) {
+  my ($vm_view,$vctrl,$vctrl_type,$vctrl_sharing) = @_;
+  my ($task_ref,$msg);
+  my $controller;
+  mDebug( 0, "Sharing: $vctrl_sharing");
+  
+  my $plstDevices = $vm_view->config->hardware->device;
+
+  # determine vmdk names currently in use so we dont clobber them with the new RDM mapping file
+  foreach my $pDevice (@$plstDevices) {
+
+    # exit if the specified SCSI controller already attached to the vm
+    if ( $pDevice->deviceInfo->label eq "SCSI controller ".$vctrl ) {
+      $module->exit_json(msg => "SCSI controller $vctrl has already been installed on the vm.", stdout => $debug_log);
+    }
+  }
+
+  if($vctrl_type eq 'LsiLogic')
+  {
+   $controller =  VirtualLsiLogicController->new(
+                    key => 0,
+                    device => [0],
+                    busNumber => $vctrl,
+                    sharedBus => VirtualSCSISharing->new($vctrl_sharing));
+  }
+  elsif($vctrl_type eq 'LsiLogicSAS')
+  {
+    $controller = VirtualLsiLogicSASController->new(
+                    key => 0,
+                    device => [0],
+                    busNumber => $vctrl,
+                    sharedBus => VirtualSCSISharing->new($vctrl_sharing));
+  }
+  elsif($vctrl_type eq 'BusLogic')
+  {
+    $controller = VirtualBusLogicController->new(
+                    key => 0,
+                    device => [0],
+                    busNumber => $vctrl,
+                    sharedBus => VirtualSCSISharing->new($vctrl_sharing));
+  }
+  elsif($vctrl_type eq 'ParaVirtual')
+  {
+    $controller = ParaVirtualSCSIController->new(
+                    key => 0,
+                    device => [0],
+                    busNumber => $vctrl,
+                    sharedBus => VirtualSCSISharing->new($vctrl_sharing));
+  }
+  else
+  {
+    Util::disconnect();
+    $module.fail_json( msg => "specified SCSI Controller type is invalid");
+  }
+
+  my $controller_vm_dev_conf_spec = VirtualDeviceConfigSpec->new(
+                                      device => $controller,
+                                      operation => VirtualDeviceConfigSpecOperation->new('add'));
+
+  my $vmChangespec = VirtualMachineConfigSpec->new(deviceChange => [ $controller_vm_dev_conf_spec ]);
+
+  eval
+  {
+    mDebug( 0, "Adding new $vctrl_type vSCSI Controller");
+    #$task_ref = $vm_view->ReconfigVM_Task(spec => $vmChangespec);
+    $vm_view->ReconfigVM(spec => $vmChangespec);
+    mDebug( 0, "VM Successfully reconfigured");
+    $changed = 1;
+    #&getStatus($task_ref,$msg);
+  };
+
+  if($@) {
+    $module->fail_json(msg => $@, stderr => $debug_log, changed => 0);
+  }
+} # AddScsiCtrl
+
+#
+# main block
+#
+
+#
+# get the key arguments
+#
+$caAction = $params->{action};
+$caClusterName = $params->{clustername};
+$caRescan = $params->{rescan};
+$caVMName = $params->{vmname};
+$nSCSI = $params->{controller};
+$nScsiControllerType = $params->{controller_type};
+$nVirtualScsiSharing = $params->{virtual_scsi_sharing};
+$param_debug_level = $params->{debug_level};
+
+my $naa_ref = $params->{naa};
+#
+# process the list of naas if passed - not needed for rescan or test
+#
+my @naa = ();
+@naa = mLoadNAAFile( $naa_ref );
+foreach my $str ( @naa ) { mDebug( 2, "naa:$str" ); }
+
+if( $caAction =~ m/^map$|^unmap$|^reattach$/i && not scalar(@naa) ) { $module->fail_json( msg => "naa list required when action is map, unmap or reattach"); }
+
+$nResult = $okay;
+
+#
+# connect to the vcenter server
+#
+Opts::parse();
+Opts::validate();
+Util::connect();
+
+#
+# verify VM name is valid
+#
+$pVMView = Vim::find_entity_view(view_type => 'VirtualMachine', filter => {"config.name" => $caVMName});
+unless (defined $pVMView){ $module->fail_json( msg => "no virtual machine named \"$caVMName\" found", stdout => $debug_log); }
+mDebug( 0, "located virtual machine:$caVMName" );
+#
+# if no clustername was given we have to find it based on the vmname
+#
+if( $caClusterName eq "" ) {
+
+  #retrieve the server which the VM is hosted on
+  $pESXHost = Vim::get_view(mo_ref => $pVMView->runtime->host);
+  unless (defined $pESXHost){ $module->fail_json( msg => "unable to retrieve ESX host for \"$caVMName\"", stdout => $debug_log); }
+  $caESXHostName = $pESXHost->name;
+
+  mDebug( 0, "$caVMName is hosted on $caESXHostName" );
+
+  # query for a list of esx cluster entities and populate the global list
+  $gplstAllClusters = Vim::find_entity_views(view_type => 'ClusterComputeResource');
+  $caClusterName = fQueryClusterName( $caESXHostName );
+
+} # end if
+
+mDebug( 0, "cluster is $caClusterName" );
+
+#
+# rescan the hbas if the action is rescan, map or reattach and the rescan flag is set to on
+# note that setting the rescan flag to off will disable a rescan even if the action is rescan
+#
+if( $caAction =~ m/^rescan$|^map$|^reattach$/i ) {
+
+  # issue a rescan of the HBAs
+  if( $caRescan =~ m/^ON$|^YES$|^TRUE$/i ) {
+    mHBARescan( $caClusterName );
+
+  } else {
+
+    mDebug( 0, "HBA rescan is disabled - set rescan to YES for HBA rescan" );
+
+  } # end if
+} # end if
+
+#
+# determine action based on the action parameter - can be map, unmap, reattach or recan
+#
+
+if( $caAction =~ m/^map$/i ) {
+
+  # check the NAAs are attached, they will not auto-attach if previously unmapped
+  $nResult = mRDMAttach( $caClusterName, $pVMView, @naa );
+
+  if( $nResult == $okay ) {
+
+    # reconfigure the vm to add the new RDMs
+    $nResult = mRDMMap( $caClusterName, $pESXHost, $pVMView, $nSCSI, @naa );
+
+  } # end if
+
+} elsif( $caAction =~m/^unmap$/i ) {
+
+  # during an unmap operation RDMs are removed from a vm
+  # the rescan operation is not integrated into this step
+  # as the array must remove the unmapped volumes from the initiator group
+  # before the hba rescan, otherwise the rescan will still find the volumes
+
+  # unmap the devices matching the naa list
+  $nResult = mRDMUnMap( $pVMView, @naa );
+
+  # if devices were unmapped they need to be detached from every host in the esx cluster
+  if( $nResult > 0 ) {
+
+    mDebug( 0, "detaching devices from all nodes of ESX cluster" );
+
+    mRDMDetach( $caClusterName, $pVMView, @naa );
+
+  } # end if
+
+} elsif( $caAction =~ m/^reattach$/i ) {
+
+  $nResult = mRDMAttach( $caClusterName, $pVMView, @naa );
+
+} elsif( $caAction =~ m/^add_scsi_controller$/i ) {
+
+  $nResult = mAddScsiCtrl( $pVMView, $nSCSI, $nScsiControllerType, $nVirtualScsiSharing);
+
+} elsif( $caAction =~ m/^test$/i ) {
+
+  # this is basically a do-nothing option to test that the connectivity to the vcenter server is ok
+  $module->exit_json( msg => "connection test completed", stdout => $debug_log);
+
+} elsif( $caAction !~ m/^rescan$/i ) {
+
+  $module->fail_json( msg => "unknown action - \"$caAction\"", stdout => $debug_log);
+
+} # end else
+
+#
+# disconnect from the vcenter server
+#
+Util::disconnect();
+
+$module->exit_json( changed => $changed, stdout => $debug_log);
